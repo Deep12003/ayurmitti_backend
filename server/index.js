@@ -13,24 +13,31 @@ import * as delhivery from "./delhivery.js";
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// ================= ENV =================
 const rootEnvPath = path.resolve(__dirname, "..", ".env");
 const serverEnvPath = path.resolve(__dirname, ".env");
-
 if (fs.existsSync(rootEnvPath)) dotenv.config({ path: rootEnvPath });
 if (fs.existsSync(serverEnvPath)) dotenv.config({ path: serverEnvPath, override: false });
 
+// ================= VALIDATE ENV =================
+const missingEnv = [];
+if (!process.env.POSTMARK_API_KEY) missingEnv.push("POSTMARK_API_KEY");
+if (!process.env.RAZORPAY_KEY_ID) missingEnv.push("RAZORPAY_KEY_ID");
+if (!process.env.RAZORPAY_KEY_SECRET) missingEnv.push("RAZORPAY_KEY_SECRET");
+if (missingEnv.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingEnv.join(", ")}`);
+  process.exit(1);
+}
+
 const app = express();
 const port = process.env.PORT || 8080;
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
-  next();
-});
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ================= FILE FALLBACK =================
 const DATA_DIR = path.resolve(__dirname, "data");
 const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
+const PRODUCTS_FILE = path.join(DATA_DIR, "products.json");
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 
 const ensureDataDir = () => {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -40,8 +47,7 @@ const readFromDisk = (file, fallback = []) => {
   try {
     ensureDataDir();
     if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(fallback), "utf-8");
-    const raw = fs.readFileSync(file, "utf-8");
-    return JSON.parse(raw);
+    return JSON.parse(fs.readFileSync(file, "utf-8"));
   } catch (e) {
     console.error(`❌ Failed to read ${file}:`, e.message);
     return fallback;
@@ -65,6 +71,11 @@ if (DATABASE_URL) {
     connectionString: DATABASE_URL,
     ssl: DB_SSL ? { rejectUnauthorized: false } : false,
   });
+
+  pool.on("error", (err) => {
+    console.error("❌ PostgreSQL pool error:", err.message);
+    isDbReady = false;
+  });
 }
 
 const initializeDb = async () => {
@@ -73,7 +84,6 @@ const initializeDb = async () => {
     return false;
   }
   try {
-    // Orders table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS orders_store (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -81,12 +91,8 @@ const initializeDb = async () => {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    await pool.query(`
-      INSERT INTO orders_store (id, orders) VALUES (1, '[]'::jsonb)
-      ON CONFLICT (id) DO NOTHING
-    `);
+    await pool.query(`INSERT INTO orders_store (id, orders) VALUES (1, '[]'::jsonb) ON CONFLICT (id) DO NOTHING`);
 
-    // Products table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS products_store (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -94,12 +100,8 @@ const initializeDb = async () => {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    await pool.query(`
-      INSERT INTO products_store (id, products) VALUES (1, '[]'::jsonb)
-      ON CONFLICT (id) DO NOTHING
-    `);
+    await pool.query(`INSERT INTO products_store (id, products) VALUES (1, '[]'::jsonb) ON CONFLICT (id) DO NOTHING`);
 
-    // Settings table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS settings_store (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -107,10 +109,7 @@ const initializeDb = async () => {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    await pool.query(`
-      INSERT INTO settings_store (id, settings) VALUES (1, '{}'::jsonb)
-      ON CONFLICT (id) DO NOTHING
-    `);
+    await pool.query(`INSERT INTO settings_store (id, settings) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`);
 
     isDbReady = true;
     console.log("✅ PostgreSQL ready — orders, products, settings");
@@ -122,11 +121,18 @@ const initializeDb = async () => {
   }
 };
 
-// Generic DB read/write helpers
-const dbRead = async (table, fallbackFile, fallback) => {
+// ================= DB HELPERS =================
+// Explicit column names — no fragile string manipulation
+const DB_TABLES = {
+  orders:   { table: "orders_store",   col: "orders",   file: ORDERS_FILE,   fallback: [] },
+  products: { table: "products_store", col: "products", file: PRODUCTS_FILE, fallback: [] },
+  settings: { table: "settings_store", col: "settings", file: SETTINGS_FILE, fallback: {} },
+};
+
+const dbRead = async (key) => {
+  const { table, col, file, fallback } = DB_TABLES[key];
   if (pool && isDbReady) {
     try {
-      const col = table.replace('_store', ''); // orders_store → orders
       const result = await pool.query(`SELECT ${col} FROM ${table} WHERE id = 1 LIMIT 1`);
       const val = result.rows?.[0]?.[col];
       return val !== undefined ? val : fallback;
@@ -134,10 +140,11 @@ const dbRead = async (table, fallbackFile, fallback) => {
       console.error(`❌ DB read ${table} failed:`, e.message);
     }
   }
-  return readFromDisk(fallbackFile, fallback);
+  return readFromDisk(file, fallback);
 };
 
-const dbWrite = async (table, col, data, fallbackFile) => {
+const dbWrite = async (key, data) => {
+  const { table, col, file } = DB_TABLES[key];
   if (pool && isDbReady) {
     try {
       await pool.query(
@@ -149,7 +156,7 @@ const dbWrite = async (table, col, data, fallbackFile) => {
       console.error(`❌ DB write ${table} failed:`, e.message);
     }
   }
-  writeToDisk(fallbackFile, data);
+  writeToDisk(file, data);
 };
 
 // ================= CORS =================
@@ -170,15 +177,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ================= POSTMARK =================
-if (!process.env.POSTMARK_API_KEY) {
-  console.error("❌ POSTMARK_API_KEY missing");
-  process.exit(1);
-}
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// ================= SERVICES =================
 const postmarkClient = new postmark.ServerClient(process.env.POSTMARK_API_KEY);
 const MAIL_FROM = process.env.MAIL_FROM || "Ayurmitti <info@ayurmitti.com>";
 
-// ================= RAZORPAY =================
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
@@ -194,7 +199,7 @@ app.get("/api/health", (req, res) => {
 // =====================================================
 app.get("/api/orders", async (req, res) => {
   try {
-    const orders = await dbRead('orders_store', ORDERS_FILE, []);
+    const orders = await dbRead("orders");
     res.json({ success: true, orders: Array.isArray(orders) ? orders : [] });
   } catch (err) {
     res.status(500).json({ success: false, error: "Failed to load orders" });
@@ -207,7 +212,7 @@ app.post("/api/orders", async (req, res) => {
     if (!Array.isArray(orders)) {
       return res.status(400).json({ success: false, error: "orders must be an array" });
     }
-    await dbWrite('orders_store', 'orders', orders, ORDERS_FILE);
+    await dbWrite("orders", orders);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: "Failed to save orders" });
@@ -217,11 +222,9 @@ app.post("/api/orders", async (req, res) => {
 // =====================================================
 // 🛍️ PRODUCTS
 // =====================================================
-const PRODUCTS_FILE = path.join(DATA_DIR, "products.json");
-
 app.get("/api/products", async (req, res) => {
   try {
-    const products = await dbRead('products_store', PRODUCTS_FILE, []);
+    const products = await dbRead("products");
     res.json({ success: true, products: Array.isArray(products) ? products : [] });
   } catch (err) {
     res.status(500).json({ success: false, error: "Failed to load products" });
@@ -234,7 +237,7 @@ app.post("/api/products", async (req, res) => {
     if (!Array.isArray(products)) {
       return res.status(400).json({ success: false, error: "products must be an array" });
     }
-    await dbWrite('products_store', 'products', products, PRODUCTS_FILE);
+    await dbWrite("products", products);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: "Failed to save products" });
@@ -244,20 +247,21 @@ app.post("/api/products", async (req, res) => {
 // =====================================================
 // ⚙️ SETTINGS
 // =====================================================
-const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
-
 const DEFAULT_SETTINGS = {
-  storeName: 'Ayurmitti',
-  email: 'info@ayurmitti.com',
-  phone: '+91 9636910582',
-  address: 'Rajasthan, India',
-  freeShippingThreshold: 500
+  storeName: "Ayurmitti",
+  email: "info@ayurmitti.com",
+  phone: "+91 9636910582",
+  address: "Rajasthan, India",
+  freeShippingThreshold: 500,
 };
 
 app.get("/api/settings", async (req, res) => {
   try {
-    const settings = await dbRead('settings_store', SETTINGS_FILE, DEFAULT_SETTINGS);
-    res.json({ success: true, settings: settings && Object.keys(settings).length > 0 ? settings : DEFAULT_SETTINGS });
+    const settings = await dbRead("settings");
+    res.json({
+      success: true,
+      settings: settings && Object.keys(settings).length > 0 ? settings : DEFAULT_SETTINGS,
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: "Failed to load settings" });
   }
@@ -266,10 +270,10 @@ app.get("/api/settings", async (req, res) => {
 app.post("/api/settings", async (req, res) => {
   try {
     const { settings } = req.body;
-    if (!settings || typeof settings !== 'object') {
+    if (!settings || typeof settings !== "object") {
       return res.status(400).json({ success: false, error: "settings must be an object" });
     }
-    await dbWrite('settings_store', 'settings', settings, SETTINGS_FILE);
+    await dbWrite("settings", settings);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: "Failed to save settings" });
@@ -420,7 +424,7 @@ app.post("/api/send-shipping-update", async (req, res) => {
           <p style="margin:0 0 36px;font-size:15px;color:#3a5a4a;line-height:1.8;font-weight:300;">Great news! Your Ayurmitti order has been dispatched and is making its way to you.</p>
           <p style="margin:0 0 16px;font-size:11px;letter-spacing:4px;color:#5a8a6a;text-transform:uppercase;font-weight:500;">Shipment Details</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4faf5;border-radius:10px;border:1px solid #d8ede0;">
-            <tr><td style="padding:18px 24px 14px;${order.trackingId ? 'border-bottom:1px solid #d8ede0;' : ''}">
+            <tr><td style="padding:18px 24px 14px;${order.trackingId ? "border-bottom:1px solid #d8ede0;" : ""}">
               <table width="100%" cellpadding="0" cellspacing="0"><tr>
                 <td style="font-size:13px;color:#6a9a7a;font-weight:300;">Order ID</td>
                 <td align="right" style="font-size:13px;color:#1a3a28;font-weight:500;">${order.id}</td>
@@ -534,10 +538,8 @@ app.post("/api/delivery/create-shipment", async (req, res) => {
       order_id, customer_name, customer_phone, customer_email,
       destination_pincode, destination_address, destination_city,
       destination_state, payment_mode = "Prepaid", total_amount = 0,
-      product_description = "Ayurvedic Products", weight = 0.5
+      product_description = "Ayurvedic Products", weight = 0.5,
     } = req.body;
-
-    const deliveryPaymentMode = payment_mode.toLowerCase() === "cod" ? "COD" : "Prepaid";
 
     if (!order_id || !customer_name || !customer_phone || !destination_pincode || !destination_address) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
@@ -548,13 +550,13 @@ app.post("/api/delivery/create-shipment", async (req, res) => {
       destination_pincode, destination_address,
       destination_city: destination_city || "",
       destination_state: destination_state || "",
-      payment_mode: deliveryPaymentMode,
-      total_amount, product_description, weight
+      payment_mode: payment_mode.toLowerCase() === "cod" ? "COD" : "Prepaid",
+      total_amount, product_description, weight,
     });
 
     if (result.success) {
       try {
-        const orders = await dbRead('orders_store', ORDERS_FILE, []);
+        const orders = await dbRead("orders");
         const idx = orders.findIndex(o => o.id === order_id);
         if (idx !== -1) {
           orders[idx].delivery = {
@@ -563,9 +565,9 @@ app.post("/api/delivery/create-shipment", async (req, res) => {
             shipment_id: result.shipment_id,
             status: result.status,
             tracking_url: result.tracking_url,
-            created_at: new Date().toISOString()
+            created_at: new Date().toISOString(),
           };
-          await dbWrite('orders_store', 'orders', orders, ORDERS_FILE);
+          await dbWrite("orders", orders);
         }
       } catch (dbError) {
         console.warn("⚠️ Could not update order with delivery info:", dbError.message);
@@ -596,15 +598,15 @@ app.post("/api/delivery/cancel", async (req, res) => {
     const result = await delhivery.cancelShipment(waybill);
     if (result.success) {
       try {
-        const orders = await dbRead('orders_store', ORDERS_FILE, []);
-        for (let order of orders) {
+        const orders = await dbRead("orders");
+        for (const order of orders) {
           if (order.delivery?.waybill === waybill) {
             order.delivery.status = "cancelled";
             order.delivery.cancelled_at = new Date().toISOString();
             break;
           }
         }
-        await dbWrite('orders_store', 'orders', orders, ORDERS_FILE);
+        await dbWrite("orders", orders);
       } catch (dbError) {
         console.warn("⚠️ Could not update cancellation status:", dbError.message);
       }
@@ -621,7 +623,7 @@ app.post("/api/delivery/cancel", async (req, res) => {
 app.post("/api/delivery/register-warehouse", async (req, res) => {
   try {
     const response = await axios.post(
-      `${process.env.DELHIVERY_BASE_URL || 'https://express.delhivery.com'}/api/backend/clientwarehouse/create/`,
+      `${process.env.DELHIVERY_BASE_URL || "https://express.delhivery.com"}/api/backend/clientwarehouse/create/`,
       {
         name: process.env.WAREHOUSE_NAME || "GS Traders",
         email: process.env.WAREHOUSE_EMAIL || "info@ayurmitti.com",
@@ -635,13 +637,13 @@ app.post("/api/delivery/register-warehouse", async (req, res) => {
         return_pin: process.env.WAREHOUSE_PINCODE || "332404",
         return_city: process.env.WAREHOUSE_CITY || "Reengus",
         return_state: process.env.WAREHOUSE_STATE || "Rajasthan",
-        return_country: "India"
+        return_country: "India",
       },
       {
         headers: {
-          "Authorization": `Token ${process.env.DELHIVERY_API_KEY}`,
-          "Content-Type": "application/json"
-        }
+          Authorization: `Token ${process.env.DELHIVERY_API_KEY}`,
+          "Content-Type": "application/json",
+        },
       }
     );
     res.json({ success: true, data: response.data });
@@ -651,6 +653,24 @@ app.post("/api/delivery/register-warehouse", async (req, res) => {
   }
 });
 
+// ================= GRACEFUL SHUTDOWN =================
+const shutdown = (signal) => {
+  console.log(`\n${signal} received — shutting down gracefully`);
+  if (pool) {
+    pool.end(() => {
+      console.log("🔌 PostgreSQL pool closed");
+      process.exit(0);
+    });
+    // Force exit if pool doesn't close within 5s
+    setTimeout(() => process.exit(0), 5000).unref();
+  } else {
+    process.exit(0);
+  }
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 // ================= START =================
 const startServer = async () => {
   await initializeDb();
@@ -658,4 +678,5 @@ const startServer = async () => {
     console.log(`🚀 Server running on port ${port}`);
   });
 };
+
 startServer();
